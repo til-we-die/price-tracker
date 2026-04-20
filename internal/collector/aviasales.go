@@ -2,6 +2,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,13 +12,19 @@ import (
 	"price-tracker/internal/model"
 )
 
-// AviasalesProvider — провайдер для API Aviasales (Travelpayouts)
+// AviasalesProvider - провайдер для API Aviasales (Travelpayouts)
 type AviasalesProvider struct {
-	token string // API токен
+	token  string // API токен
+	client *http.Client
 }
 
 func NewAviasalesProvider(token string) *AviasalesProvider {
-	return &AviasalesProvider{token: token}
+	return &AviasalesProvider{
+		token: token,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
 }
 
 // ответ API Aviasales
@@ -35,6 +42,11 @@ type apiResponse struct {
 // Search выполняет поиск билетов по заданным параметрам
 // Возвращает отсортированный по цене список перелётов
 func (a *AviasalesProvider) Search(params model.SearchParams) ([]model.Flight, error) {
+	return a.SearchWithContext(context.Background(), params)
+}
+
+// SearchWithContext выполняет поиск с поддержкой контекста
+func (a *AviasalesProvider) SearchWithContext(ctx context.Context, params model.SearchParams) ([]model.Flight, error) {
 	departureDate := params.DateFrom.Format("2006-01-02")
 
 	var url string
@@ -61,23 +73,27 @@ func (a *AviasalesProvider) Search(params model.SearchParams) ([]model.Flight, e
 		)
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("http request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Проверяем статус ответа
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("api returned non-200 status: %d", resp.StatusCode)
+	}
+
 	var apiResp apiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	var flights []model.Flight

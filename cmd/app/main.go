@@ -90,10 +90,18 @@ func main() {
 
 		log.Printf("[DEBUG] searching departure date: %s", depDay.Format("2006-01-02"))
 
-		flights := collector.CollectAll(providers, search)
+		// Используем новую функцию с таймаутом 30 секунд
+		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
+		if err != nil {
+			log.Printf("[ERROR] search failed for %s: %v", depDay.Format("2006-01-02"), err)
+			time.Sleep(2 * time.Second) // Пауза перед следующей попыткой
+			continue
+		}
 
 		if len(flights) > 0 {
 			log.Printf("[DEBUG] found %d flights for %s", len(flights), depDay.Format("2006-01-02"))
+		} else {
+			log.Printf("[DEBUG] no flights found for %s", depDay.Format("2006-01-02"))
 		}
 
 		for _, f := range flights {
@@ -153,10 +161,18 @@ func main() {
 
 		log.Printf("[DEBUG] searching return date: %s", retDay.Format("2006-01-02"))
 
-		flights := collector.CollectAll(providers, search)
+		// Используем новую функцию с таймаутом 30 секунд
+		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
+		if err != nil {
+			log.Printf("[ERROR] search failed for %s: %v", retDay.Format("2006-01-02"), err)
+			time.Sleep(2 * time.Second) // Пауза перед следующей попыткой
+			continue
+		}
 
 		if len(flights) > 0 {
 			log.Printf("[DEBUG] found %d flights for %s", len(flights), retDay.Format("2006-01-02"))
+		} else {
+			log.Printf("[DEBUG] no flights found for %s", retDay.Format("2006-01-02"))
 		}
 
 		for _, f := range flights {
