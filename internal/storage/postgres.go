@@ -2,85 +2,192 @@
 package storage
 
 import (
-	"database/sql"
+	"context"
+	"fmt"
 	"os"
+	"time"
+
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"price-tracker/internal/model"
-
-	_ "github.com/lib/pq"
 )
 
 type Postgres struct {
-	db *sql.DB
+	db *gorm.DB
 }
 
+// новое подключение к БД
 func NewPostgres() (*Postgres, error) {
 	dsn := os.Getenv("DB_DSN")
-	db, err := sql.Open("postgres", dsn)
+	if dsn == "" {
+		return nil, fmt.Errorf("DB_DSN is empty")
+	}
+
+	// Настройка GORM
+	config := &gorm.Config{
+		Logger:                 logger.Default.LogMode(logger.Warn),
+		SkipDefaultTransaction: true,
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect database: %w", err)
+	}
+
+	// Настройка пула соединений
+	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, err
+	}
+
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+
+	// Автоматическая миграция схемы
+	if err := db.AutoMigrate(&Price{}, &Notification{}); err != nil {
+		return nil, fmt.Errorf("failed to migrate database: %w", err)
 	}
 
 	return &Postgres{db: db}, nil
 }
 
-func (p *Postgres) SavePrice(f model.Flight, route string) error {
-	query := `
-		INSERT INTO prices (price, currency, departure, return_date, url, provider, route, flight_type, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-	`
-
-	// Обработка нулевой даты возврата
-	var returnDate interface{}
-	if f.Return.IsZero() {
-		returnDate = nil
-	} else {
-		returnDate = f.Return
+func (p *Postgres) SavePrice(ctx context.Context, f model.Flight, route string) error {
+	price := &Price{
+		Price:      f.Price,
+		Currency:   f.Currency,
+		Departure:  f.Departure,
+		URL:        f.URL,
+		Provider:   f.Provider,
+		Route:      route,
+		FlightType: string(f.FlightType),
 	}
 
-	_, err := p.db.Exec(
-		query,
-		f.Price,
-		f.Currency,
-		f.Departure,
-		returnDate,
-		f.URL,
-		f.Provider,
-		route,
-		f.FlightType,
-	)
+	// Обработка даты возврата
+	if !f.Return.IsZero() {
+		price.ReturnDate = &f.Return
+	}
 
-	return err
+	return p.db.WithContext(ctx).Create(price).Error
 }
 
-func (p *Postgres) DB() *sql.DB {
-	return p.db
+func (p *Postgres) GetMinPrice(ctx context.Context, route string) (int, error) {
+	var minPrice int
+
+	err := p.db.WithContext(ctx).
+		Model(&Price{}).
+		Where("route = ?", route).
+		Select("COALESCE(MIN(price), 0)").
+		Scan(&minPrice).Error
+
+	return minPrice, err
 }
 
-func (p *Postgres) GetMinPrice(route string) (int, error) {
-	var min int
+func (p *Postgres) GetMinPriceByType(ctx context.Context, route string, flightType model.FlightType) (int, error) {
+	var minPrice int
 
-	err := p.db.QueryRow(`
-		SELECT COALESCE(MIN(price), 0)
-		FROM prices
-		WHERE route = $1
-	`, route).Scan(&min)
+	err := p.db.WithContext(ctx).
+		Model(&Price{}).
+		Where("route = ? AND flight_type = ?", route, string(flightType)).
+		Select("COALESCE(MIN(price), 0)").
+		Scan(&minPrice).Error
 
-	return min, err
+	return minPrice, err
 }
 
-func (p *Postgres) GetMinPriceByType(route string, flightType model.FlightType) (int, error) {
-	var min int
+func (p *Postgres) SaveNotification(ctx context.Context, route string, price int) error {
+	notification := &Notification{
+		Route:  route,
+		Price:  price,
+		SentAt: time.Now(),
+	}
 
-	err := p.db.QueryRow(`
-		SELECT COALESCE(MIN(price), 0)
-		FROM prices
-		WHERE route = $1 AND flight_type = $2
-	`, route, flightType).Scan(&min)
+	return p.db.WithContext(ctx).Create(notification).Error
+}
 
-	return min, err
+func (p *Postgres) GetLastNotification(ctx context.Context, route string) (int, error) {
+	var notification Notification
+
+	err := p.db.WithContext(ctx).
+		Where("route = ?", route).
+		Order("sent_at DESC").
+		First(&notification).Error
+
+	if err == gorm.ErrRecordNotFound {
+		return 0, nil
+	}
+
+	return notification.Price, err
+}
+
+func (p *Postgres) GetLastNotificationByType(ctx context.Context, route string, flightType string) (int, error) {
+	var notification Notification
+
+	err := p.db.WithContext(ctx).
+		Table("notifications").
+		Select("notifications.price").
+		Joins("JOIN prices ON notifications.route = prices.route AND notifications.price = prices.price").
+		Where("notifications.route = ? AND prices.flight_type = ?", route, flightType).
+		Order("notifications.sent_at DESC").
+		Limit(1).
+		Scan(&notification).Error
+
+	if err == gorm.ErrRecordNotFound {
+		return 0, nil
+	}
+
+	return notification.Price, err
+}
+
+func (p *Postgres) GetPriceHistory(ctx context.Context, route string, limit int) ([]Price, error) {
+	var prices []Price
+
+	err := p.db.WithContext(ctx).
+		Where("route = ?", route).
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&prices).Error
+
+	return prices, err
+}
+
+func (p *Postgres) GetBestPricesByDate(ctx context.Context, route string) (map[string]int, error) {
+	type Result struct {
+		Date  time.Time
+		Price int
+	}
+
+	var results []Result
+
+	err := p.db.WithContext(ctx).
+		Model(&Price{}).
+		Select("DATE(departure) as date, MIN(price) as price").
+		Where("route = ?", route).
+		Group("DATE(departure)").
+		Scan(&results).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	priceMap := make(map[string]int)
+	for _, r := range results {
+		priceMap[r.Date.Format("2006-01-02")] = r.Price
+	}
+
+	return priceMap, nil
 }
 
 func (p *Postgres) Close() error {
-	return p.db.Close()
+	sqlDB, err := p.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
+func (p *Postgres) DB() *gorm.DB {
+	return p.db
 }

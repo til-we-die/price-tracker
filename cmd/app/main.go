@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"time"
@@ -35,7 +36,14 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := db.DB().Ping(); err != nil {
+	gormDB := db.DB()
+
+	sqlDB, err := gormDB.DB()
+	if err != nil {
+		log.Fatal("[ERROR] failed to get sql.DB:", err)
+	}
+
+	if err := sqlDB.Ping(); err != nil {
 		log.Fatal("[ERROR] db not reachable:", err)
 	}
 
@@ -51,7 +59,6 @@ func main() {
 		collector.NewAviasalesProvider(token),
 	}
 
-	// Диапазоны дат (вынести)
 	departureStart := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
 	departureEnd := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
 	returnStart := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
@@ -90,7 +97,7 @@ func main() {
 
 		log.Printf("[DEBUG] searching departure date: %s", depDay.Format("2006-01-02"))
 
-		// Используем новую функцию с таймаутом 30 секунд
+		// таймаут 30 секунд
 		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
 		if err != nil {
 			log.Printf("[ERROR] search failed for %s: %v", depDay.Format("2006-01-02"), err)
@@ -107,11 +114,13 @@ func main() {
 		for _, f := range flights {
 			totalFlightsDeparture++
 
+			ctx := context.Background()
+
 			f.FlightType = model.OneWay
 			f.From = "LED"
 			f.To = "NOZ"
 
-			if err := db.SavePrice(f, departureRoute); err != nil {
+			if err := db.SavePrice(ctx, f, departureRoute); err != nil {
 				log.Printf("[ERROR] save price failed: %v", err)
 				continue
 			}
@@ -124,7 +133,7 @@ func main() {
 					f.Departure.Format("2006-01-02"))
 			}
 
-			should, err := analyzer.ShouldNotifyByType(db, departureRoute, f.Price, model.OneWay)
+			should, err := analyzer.ShouldNotifyByType(ctx, db, departureRoute, f.Price, model.OneWay)
 			if err != nil {
 				log.Printf("[ERROR] analyzer error: %v", err)
 				continue
@@ -136,7 +145,7 @@ func main() {
 					continue
 				}
 
-				if err := db.SaveNotification(departureRoute, f.Price); err != nil {
+				if err := db.SaveNotification(ctx, departureRoute, f.Price); err != nil {
 					log.Printf("[ERROR] save notification failed: %v", err)
 				}
 
@@ -161,7 +170,6 @@ func main() {
 
 		log.Printf("[DEBUG] searching return date: %s", retDay.Format("2006-01-02"))
 
-		// Используем новую функцию с таймаутом 30 секунд
 		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
 		if err != nil {
 			log.Printf("[ERROR] search failed for %s: %v", retDay.Format("2006-01-02"), err)
@@ -178,11 +186,13 @@ func main() {
 		for _, f := range flights {
 			totalFlightsReturn++
 
+			ctx := context.Background()
+
 			f.FlightType = model.OneWay
 			f.From = "NOZ"
 			f.To = "LED"
 
-			if err := db.SavePrice(f, returnRoute); err != nil {
+			if err := db.SavePrice(ctx, f, returnRoute); err != nil {
 				log.Printf("[ERROR] save price failed: %v", err)
 				continue
 			}
@@ -195,7 +205,7 @@ func main() {
 					f.Departure.Format("2006-01-02"))
 			}
 
-			should, err := analyzer.ShouldNotifyByType(db, returnRoute, f.Price, model.OneWay)
+			should, err := analyzer.ShouldNotifyByType(ctx, db, returnRoute, f.Price, model.OneWay)
 			if err != nil {
 				log.Printf("[ERROR] analyzer error: %v", err)
 				continue
@@ -207,7 +217,7 @@ func main() {
 					continue
 				}
 
-				if err := db.SaveNotification(returnRoute, f.Price); err != nil {
+				if err := db.SaveNotification(ctx, returnRoute, f.Price); err != nil {
 					log.Printf("[ERROR] save notification failed: %v", err)
 				}
 
@@ -218,7 +228,6 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	log.Println("[INFO] RESULTS")
 	log.Printf("[INFO] departure flights (LED->NOZ): total=%d, min=%d RUB",
 		totalFlightsDeparture, minDeparturePrice)
 	if minDeparturePrice > 0 {
@@ -226,6 +235,8 @@ func main() {
 			bestDepartureFlight.Departure.Format("2006-01-02"),
 			minDeparturePrice,
 			bestDepartureFlight.URL)
+	} else {
+		log.Printf("[WARN] no departure flights found")
 	}
 
 	log.Printf("[INFO] return flights (NOZ->LED): total=%d, min=%d RUB",
@@ -235,12 +246,17 @@ func main() {
 			bestReturnFlight.Departure.Format("2006-01-02"),
 			minReturnPrice,
 			bestReturnFlight.URL)
+	} else {
+		log.Printf("[WARN] no return flights found")
 	}
 
 	if minDeparturePrice > 0 && minReturnPrice > 0 {
 		totalPrice := minDeparturePrice + minReturnPrice
 		log.Printf("[INFO] total round-trip price: %d RUB", totalPrice)
+		log.Printf("[INFO] average price per flight: %d RUB", totalPrice/2)
+	} else if minDeparturePrice > 0 {
+		log.Printf("[INFO] one-way price (LED->NOZ): %d RUB", minDeparturePrice)
+	} else if minReturnPrice > 0 {
+		log.Printf("[INFO] one-way price (NOZ->LED): %d RUB", minReturnPrice)
 	}
-
-	log.Println("[INFO] price tracker finished")
 }

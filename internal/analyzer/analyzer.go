@@ -2,6 +2,7 @@
 package analyzer
 
 import (
+	"context" // Добавьте этот импорт
 	"price-tracker/internal/model"
 	"price-tracker/internal/storage"
 )
@@ -10,8 +11,8 @@ import (
 // Возвращает true, если:
 //   - это первый найденный билет для маршрута или
 //   - цена ниже минимальной ранее сохранённой
-func ShouldNotify(db *storage.Postgres, route string, price int) (bool, error) {
-	min, err := db.GetMinPrice(route)
+func ShouldNotify(ctx context.Context, db *storage.Postgres, route string, price int) (bool, error) {
+	min, err := db.GetMinPrice(ctx, route)
 	if err != nil {
 		return false, err
 	}
@@ -31,8 +32,8 @@ func ShouldNotify(db *storage.Postgres, route string, price int) (bool, error) {
 
 // ShouldNotifyByType проверяет, нужно ли отправить уведомление для конкретного типа перелёта
 // Аналогична ShouldNotify, но учитывает flight_type
-func ShouldNotifyByType(db *storage.Postgres, route string, price int, flightType model.FlightType) (bool, error) {
-	min, err := db.GetMinPriceByType(route, flightType)
+func ShouldNotifyByType(ctx context.Context, db *storage.Postgres, route string, price int, flightType model.FlightType) (bool, error) {
+	min, err := db.GetMinPriceByType(ctx, route, flightType)
 	if err != nil {
 		return false, err
 	}
