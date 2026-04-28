@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"time"
@@ -12,19 +13,81 @@ import (
 	"price-tracker/internal/collector"
 	"price-tracker/internal/model"
 	"price-tracker/internal/notifier"
+	"price-tracker/internal/profiler"
 	"price-tracker/internal/shutdown"
 	"price-tracker/internal/storage"
 )
 
 func main() {
-	// Загрузка переменных окружения
+	var (
+		enablePprof        = flag.Bool("pprof", false, "enable pprof HTTP server")
+		pprofPort          = flag.String("pprof-port", ":6060", "pprof server port")
+		enableMemStats     = flag.Bool("memstats", false, "enable periodic memory stats")
+		saveCPUProfile     = flag.Bool("save-cpu", false, "save CPU profile to file")
+		saveMemProfile     = flag.Bool("save-mem", false, "save memory profile to file")
+		saveBlockProfile   = flag.Bool("save-block", false, "save block profile to file")
+		saveMutexProfile   = flag.Bool("save-mutex", false, "save mutex profile to file")
+		saveGoroutine      = flag.Bool("save-goroutine", false, "save goroutine profile to file")
+		cpuProfileDuration = flag.Duration("cpu-duration", 30*time.Second, "CPU profile collection duration")
+		viewProfile        = flag.String("view", "", "view saved profile in browser (filename)")
+	)
+	flag.Parse()
+
+	if *viewProfile != "" {
+		if err := profiler.ViewProfileInBrowser(*viewProfile); err != nil {
+			log.Fatal("[ERROR] failed to view profile:", err)
+		}
+		return
+	}
+
+	if *saveCPUProfile || *saveMemProfile || *saveBlockProfile || *saveMutexProfile || *saveGoroutine {
+		config := profiler.ProfileConfig{
+			CPUProfileFile:     "cpu.prof",
+			MemProfileFile:     "mem.prof",
+			BlockProfileFile:   "block.prof",
+			MutexProfileFile:   "mutex.prof",
+			GoroutineFile:      "goroutine.prof",
+			CPUProfileDuration: *cpuProfileDuration,
+		}
+
+		if !*saveCPUProfile {
+			config.CPUProfileFile = ""
+		}
+		if !*saveMemProfile {
+			config.MemProfileFile = ""
+		}
+		if !*saveBlockProfile {
+			config.BlockProfileFile = ""
+		}
+		if !*saveMutexProfile {
+			config.MutexProfileFile = ""
+		}
+		if !*saveGoroutine {
+			config.GoroutineFile = ""
+		}
+
+		log.Println("[INFO] saving profiles before execution...")
+		if err := profiler.SaveProfiles(config); err != nil {
+			log.Printf("[WARN] failed to save profiles: %v", err)
+		}
+	}
+
+	if *enablePprof {
+		profiler.StartPprof(*pprofPort)
+	}
+
+	if *enableMemStats {
+		stopStats := make(chan struct{})
+		defer close(stopStats)
+		profiler.StartPeriodicMemStats(30*time.Second, stopStats)
+	}
+
 	if err := godotenv.Load(); err != nil {
 		log.Println("[WARN] .env file not found, using system env")
 	}
 
 	log.Println("[INFO] starting price tracker")
 
-	// менеджер graceful shutdown с таймаутом 60 секунд
 	shutdownManager := shutdown.NewShutdownManager(60 * time.Second)
 	defer func() {
 		if r := recover(); r != nil {
