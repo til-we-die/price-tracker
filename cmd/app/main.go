@@ -1,4 +1,3 @@
-// Package main — точка входа в приложение
 package main
 
 import (
@@ -13,16 +12,25 @@ import (
 	"price-tracker/internal/collector"
 	"price-tracker/internal/model"
 	"price-tracker/internal/notifier"
+	"price-tracker/internal/shutdown"
 	"price-tracker/internal/storage"
 )
 
 func main() {
-	// Загрузка переменных окружения из .env
+	// Загрузка переменных окружения
 	if err := godotenv.Load(); err != nil {
 		log.Println("[WARN] .env file not found, using system env")
 	}
 
 	log.Println("[INFO] starting price tracker")
+
+	// менеджер graceful shutdown с таймаутом 60 секунд
+	shutdownManager := shutdown.NewShutdownManager(60 * time.Second)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] panic recovered: %v", r)
+		}
+	}()
 
 	// Проверка подключения к БД
 	dsn := os.Getenv("DB_DSN")
@@ -35,6 +43,12 @@ func main() {
 		log.Fatal("[ERROR] failed to init db:", err)
 	}
 	defer db.Close()
+
+	// Очистка БД при завершении
+	shutdownManager.AddCleanup(func() error {
+		log.Println("[INFO] closing database connection...")
+		return db.Close()
+	})
 
 	gormDB := db.DB()
 
@@ -83,149 +97,236 @@ func main() {
 	totalFlightsDeparture := 0
 	totalFlightsReturn := 0
 
-	// Поиск рейсов "туда"
-	log.Println("[INFO] searching departure flights (LED -> NOZ)")
+	// Поиск рейсов "туда" в отдельной горутине
+	shutdownManager.AddDelta(1)
+	go func() {
+		defer shutdownManager.Done()
+		defer log.Println("[INFO] departure search goroutine finished")
 
-	for depDay := departureStart; !depDay.After(departureEnd); depDay = depDay.AddDate(0, 0, 1) {
-		search := model.SearchParams{
-			From:      "LED",
-			To:        "NOZ",
-			DateFrom:  depDay,
-			DateTo:    depDay,
-			RoundTrip: false,
-		}
+		log.Println("[INFO] searching departure flights (LED -> NOZ)")
 
-		log.Printf("[DEBUG] searching departure date: %s", depDay.Format("2006-01-02"))
-
-		// таймаут 30 секунд
-		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
-		if err != nil {
-			log.Printf("[ERROR] search failed for %s: %v", depDay.Format("2006-01-02"), err)
-			time.Sleep(2 * time.Second) // Пауза перед следующей попыткой
-			continue
-		}
-
-		if len(flights) > 0 {
-			log.Printf("[DEBUG] found %d flights for %s", len(flights), depDay.Format("2006-01-02"))
-		} else {
-			log.Printf("[DEBUG] no flights found for %s", depDay.Format("2006-01-02"))
-		}
-
-		for _, f := range flights {
-			totalFlightsDeparture++
-
-			ctx := context.Background()
-
-			f.FlightType = model.OneWay
-			f.From = "LED"
-			f.To = "NOZ"
-
-			if err := db.SavePrice(ctx, f, departureRoute); err != nil {
-				log.Printf("[ERROR] save price failed: %v", err)
-				continue
+		for depDay := departureStart; !depDay.After(departureEnd); depDay = depDay.AddDate(0, 0, 1) {
+			// Проверка сигнала завершения
+			select {
+			case <-shutdownManager.Context().Done():
+				log.Println("[INFO] shutdown signal received, stopping departure search")
+				return
+			default:
 			}
 
-			if minDeparturePrice == 0 || f.Price < minDeparturePrice {
-				minDeparturePrice = f.Price
-				bestDepartureFlight = f
-				log.Printf("[INFO] new min departure price: %d RUB on %s",
-					f.Price,
-					f.Departure.Format("2006-01-02"))
+			search := model.SearchParams{
+				From:      "LED",
+				To:        "NOZ",
+				DateFrom:  depDay,
+				DateTo:    depDay,
+				RoundTrip: false,
 			}
 
-			should, err := analyzer.ShouldNotifyByType(ctx, db, departureRoute, f.Price, model.OneWay)
+			log.Printf("[DEBUG] searching departure date: %s", depDay.Format("2006-01-02"))
+
+			ctx, cancel := context.WithTimeout(shutdownManager.Context(), 30*time.Second)
+
+			flights, err := collector.CollectAllWithContext(ctx, providers, search)
+			cancel()
+
 			if err != nil {
-				log.Printf("[ERROR] analyzer error: %v", err)
+				log.Printf("[ERROR] search failed for %s: %v", depDay.Format("2006-01-02"), err)
+				if shutdownManager.Context().Err() != nil {
+					return
+				}
+				time.Sleep(2 * time.Second)
 				continue
 			}
 
-			if should {
-				if err := notifier.SendEmail(f); err != nil {
-					log.Printf("[ERROR] email send failed: %v", err)
+			if len(flights) > 0 {
+				log.Printf("[DEBUG] found %d flights for %s", len(flights), depDay.Format("2006-01-02"))
+			} else {
+				log.Printf("[DEBUG] no flights found for %s", depDay.Format("2006-01-02"))
+			}
+
+			for _, f := range flights {
+				select {
+				case <-shutdownManager.Context().Done():
+					log.Println("[INFO] shutdown signal received, stopping flight processing")
+					return
+				default:
+				}
+
+				totalFlightsDeparture++
+
+				f.FlightType = model.OneWay
+				f.From = "LED"
+				f.To = "NOZ"
+
+				saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := db.SavePrice(saveCtx, f, departureRoute); err != nil {
+					log.Printf("[ERROR] save price failed: %v", err)
+					saveCancel()
+					continue
+				}
+				saveCancel()
+
+				// Атомарное обновление минимума (сменить на мьютекс)
+				if minDeparturePrice == 0 || f.Price < minDeparturePrice {
+					minDeparturePrice = f.Price
+					bestDepartureFlight = f
+					log.Printf("[INFO] new min departure price: %d RUB on %s",
+						f.Price,
+						f.Departure.Format("2006-01-02"))
+				}
+
+				notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				should, err := analyzer.ShouldNotifyByType(notifyCtx, db, departureRoute, f.Price, model.OneWay)
+				notifyCancel()
+
+				if err != nil {
+					log.Printf("[ERROR] analyzer error: %v", err)
 					continue
 				}
 
-				if err := db.SaveNotification(ctx, departureRoute, f.Price); err != nil {
-					log.Printf("[ERROR] save notification failed: %v", err)
+				if should {
+					if err := notifier.SendEmail(f); err != nil {
+						log.Printf("[ERROR] email send failed: %v", err)
+						continue
+					}
+
+					saveNotifCtx, saveNotifCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := db.SaveNotification(saveNotifCtx, departureRoute, f.Price); err != nil {
+						log.Printf("[ERROR] save notification failed: %v", err)
+					}
+					saveNotifCancel()
+
+					log.Printf("[INFO] notification sent for price %d RUB", f.Price)
+				}
+			}
+
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	// Поиск рейсов "обратно" в отдельной горутине
+	shutdownManager.AddDelta(1)
+	go func() {
+		defer shutdownManager.Done()
+		defer log.Println("[INFO] return search goroutine finished")
+
+		log.Println("[INFO] searching return flights (NOZ -> LED)")
+
+		for retDay := returnStart; !retDay.After(returnEnd); retDay = retDay.AddDate(0, 0, 1) {
+			select {
+			case <-shutdownManager.Context().Done():
+				log.Println("[INFO] shutdown signal received, stopping return search")
+				return
+			default:
+			}
+
+			search := model.SearchParams{
+				From:      "NOZ",
+				To:        "LED",
+				DateFrom:  retDay,
+				DateTo:    retDay,
+				RoundTrip: false,
+			}
+
+			log.Printf("[DEBUG] searching return date: %s", retDay.Format("2006-01-02"))
+
+			ctx, cancel := context.WithTimeout(shutdownManager.Context(), 30*time.Second)
+
+			flights, err := collector.CollectAllWithContext(ctx, providers, search)
+			cancel()
+
+			if err != nil {
+				log.Printf("[ERROR] search failed for %s: %v", retDay.Format("2006-01-02"), err)
+				if shutdownManager.Context().Err() != nil {
+					return
+				}
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			if len(flights) > 0 {
+				log.Printf("[DEBUG] found %d flights for %s", len(flights), retDay.Format("2006-01-02"))
+			} else {
+				log.Printf("[DEBUG] no flights found for %s", retDay.Format("2006-01-02"))
+			}
+
+			for _, f := range flights {
+				select {
+				case <-shutdownManager.Context().Done():
+					log.Println("[INFO] shutdown signal received, stopping flight processing")
+					return
+				default:
 				}
 
-				log.Printf("[INFO] notification sent for price %d RUB", f.Price)
-			}
-		}
+				totalFlightsReturn++
 
-		time.Sleep(1 * time.Second)
-	}
+				f.FlightType = model.OneWay
+				f.From = "NOZ"
+				f.To = "LED"
 
-	// Поиск рейсов "обратно"
-	log.Println("[INFO] searching return flights (NOZ -> LED)")
+				saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := db.SavePrice(saveCtx, f, returnRoute); err != nil {
+					log.Printf("[ERROR] save price failed: %v", err)
+					saveCancel()
+					continue
+				}
+				saveCancel()
 
-	for retDay := returnStart; !retDay.After(returnEnd); retDay = retDay.AddDate(0, 0, 1) {
-		search := model.SearchParams{
-			From:      "NOZ",
-			To:        "LED",
-			DateFrom:  retDay,
-			DateTo:    retDay,
-			RoundTrip: false,
-		}
+				// Атомарное обновление минимума
+				if minReturnPrice == 0 || f.Price < minReturnPrice {
+					minReturnPrice = f.Price
+					bestReturnFlight = f
+					log.Printf("[INFO] new min return price: %d RUB on %s",
+						f.Price,
+						f.Departure.Format("2006-01-02"))
+				}
 
-		log.Printf("[DEBUG] searching return date: %s", retDay.Format("2006-01-02"))
+				notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				should, err := analyzer.ShouldNotifyByType(notifyCtx, db, returnRoute, f.Price, model.OneWay)
+				notifyCancel()
 
-		flights, err := collector.CollectAllWithTimeout(providers, search, 30*time.Second)
-		if err != nil {
-			log.Printf("[ERROR] search failed for %s: %v", retDay.Format("2006-01-02"), err)
-			time.Sleep(2 * time.Second) // Пауза перед следующей попыткой
-			continue
-		}
-
-		if len(flights) > 0 {
-			log.Printf("[DEBUG] found %d flights for %s", len(flights), retDay.Format("2006-01-02"))
-		} else {
-			log.Printf("[DEBUG] no flights found for %s", retDay.Format("2006-01-02"))
-		}
-
-		for _, f := range flights {
-			totalFlightsReturn++
-
-			ctx := context.Background()
-
-			f.FlightType = model.OneWay
-			f.From = "NOZ"
-			f.To = "LED"
-
-			if err := db.SavePrice(ctx, f, returnRoute); err != nil {
-				log.Printf("[ERROR] save price failed: %v", err)
-				continue
-			}
-
-			if minReturnPrice == 0 || f.Price < minReturnPrice {
-				minReturnPrice = f.Price
-				bestReturnFlight = f
-				log.Printf("[INFO] new min return price: %d RUB on %s",
-					f.Price,
-					f.Departure.Format("2006-01-02"))
-			}
-
-			should, err := analyzer.ShouldNotifyByType(ctx, db, returnRoute, f.Price, model.OneWay)
-			if err != nil {
-				log.Printf("[ERROR] analyzer error: %v", err)
-				continue
-			}
-
-			if should {
-				if err := notifier.SendEmail(f); err != nil {
-					log.Printf("[ERROR] email send failed: %v", err)
+				if err != nil {
+					log.Printf("[ERROR] analyzer error: %v", err)
 					continue
 				}
 
-				if err := db.SaveNotification(ctx, returnRoute, f.Price); err != nil {
-					log.Printf("[ERROR] save notification failed: %v", err)
+				if should {
+					if err := notifier.SendEmail(f); err != nil {
+						log.Printf("[ERROR] email send failed: %v", err)
+						continue
+					}
+
+					saveNotifCtx, saveNotifCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := db.SaveNotification(saveNotifCtx, returnRoute, f.Price); err != nil {
+						log.Printf("[ERROR] save notification failed: %v", err)
+					}
+					saveNotifCancel()
+
+					log.Printf("[INFO] notification sent for price %d RUB", f.Price)
 				}
-
-				log.Printf("[INFO] notification sent for price %d RUB", f.Price)
 			}
-		}
 
-		time.Sleep(1 * time.Second)
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	// Запуск ожидания сигналов завершения
+	go shutdownManager.WaitForShutdown()
+
+	// Ожидание завершения всех поисковых горутин
+	done := make(chan struct{})
+	go func() {
+		shutdownManager.WaitGroup().Wait()
+		close(done)
+	}()
+
+	// Ожидание либо завершения всех поисков, либо сигнала о завершении
+	select {
+	case <-done:
+		log.Println("[INFO] all search tasks completed")
+	case <-shutdownManager.ShutdownComplete():
+		log.Println("[INFO] shutdown signal received, waiting for goroutines to finish...")
+		time.Sleep(2 * time.Second)
 	}
 
 	log.Printf("[INFO] departure flights (LED->NOZ): total=%d, min=%d RUB",
@@ -257,6 +358,6 @@ func main() {
 	} else if minDeparturePrice > 0 {
 		log.Printf("[INFO] one-way price (LED->NOZ): %d RUB", minDeparturePrice)
 	} else if minReturnPrice > 0 {
-		log.Printf("[INFO] one-way price (NOZ->LED): %d RUB", minReturnPrice)
+		log.Printf("[INFO] one-way price (NOZ->LED): %d RMB", minReturnPrice)
 	}
 }
